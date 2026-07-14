@@ -18,8 +18,8 @@
 #   ./docker-pull-curl.sh
 #
 # Usage (via SOCKS5 proxy, e.g. Tor or SSH tunnel):
+#   export ALL_PROXY="socks5h://127.0.0.1:9050"
 #   export IMAGE="library/nginx" TAG="latest"
-#   export PROXY="socks5h://127.0.0.1:9050"
 #   ./docker-pull-curl.sh
 #
 # For official images the namespace is "library/<name>".
@@ -49,38 +49,105 @@ fi
 echo "==> Downloading ${IMAGE}:${TAG} from ${REGISTRY}"
 
 # ── 1. Get an auth token (anonymous or authenticated) ────────────────
+auth_url_full="${AUTH_URL}?service=registry.docker.io&scope=repository:${IMAGE}:pull"
 echo "--> Requesting auth token..."
+echo "    URL: ${auth_url_full}"
+
 auth_args=()
 if [[ -n "${DOCKER_USER}" && -n "${DOCKER_PASS}" ]]; then
   echo "    (authenticating as ${DOCKER_USER})"
   auth_args=(-u "${DOCKER_USER}:${DOCKER_PASS}")
 fi
 
-token=$(
-  curl -sf "${auth_args[@]+"${auth_args[@]}"}" \
-    "${AUTH_URL}?service=registry.docker.io&scope=repository:${IMAGE}:pull" \
-    | jq -jr '.token'
-)
+http_code=$(
+  curl -sS -w '%{http_code}' -o /tmp/token_response.json \
+    "${auth_args[@]+"${auth_args[@]}"}" \
+    "${auth_url_full}" \
+    2>/tmp/curl_err.log
+) || {
+  echo "ERROR: curl failed on token request"
+  echo "--- curl stderr ---"
+  cat /tmp/curl_err.log
+  exit 1
+}
 
-if [[ -z "${token}" || "${token}" == "null" ]]; then
-  echo "ERROR: failed to obtain auth token (bad credentials?)"
+echo "    HTTP ${http_code}"
+
+if [[ "${http_code}" -ge 400 ]]; then
+  echo "ERROR: token request returned HTTP ${http_code}"
+  echo "--- response body ---"
+  cat /tmp/token_response.json
   exit 1
 fi
 
-# ── 2. (Optional) List available tags ────────────────────────────────
+token=$(jq -jr '.token // empty' /tmp/token_response.json)
+
+if [[ -z "${token}" ]]; then
+  echo "ERROR: no token in response"
+  echo "--- response body ---"
+  cat /tmp/token_response.json
+  exit 1
+fi
+
+echo "    token acquired (${#token} chars)"
+
+# ── 2. Verify the tag exists ──────────────────────────────────────────
 echo "--> Verifying tag '${TAG}' exists..."
-curl -sf \
-  -H "Authorization: Bearer ${token}" \
-  "https://${REGISTRY}/v2/${IMAGE}/tags/list" \
-  | jq -e --arg t "${TAG}" '.tags | index($t)' > /dev/null \
-  || { echo "ERROR: tag '${TAG}' not found"; exit 1; }
+tags_url="https://${REGISTRY}/v2/${IMAGE}/tags/list"
+echo "    URL: ${tags_url}"
+
+http_code=$(
+  curl -sS -w '%{http_code}' -o /tmp/tags_response.json \
+    -H "Authorization: Bearer ${token}" \
+    "${tags_url}" \
+    2>/tmp/curl_err.log
+) || {
+  echo "ERROR: curl failed on tags request"
+  echo "--- curl stderr ---"
+  cat /tmp/curl_err.log
+  exit 1
+}
+
+echo "    HTTP ${http_code}"
+
+if [[ "${http_code}" -ge 400 ]]; then
+  echo "ERROR: tags request returned HTTP ${http_code}"
+  echo "--- response body ---"
+  cat /tmp/tags_response.json
+  exit 1
+fi
+
+if ! jq -e --arg t "${TAG}" '.tags | index($t)' /tmp/tags_response.json > /dev/null 2>&1; then
+  echo "ERROR: tag '${TAG}' not found in repository"
+  echo "    available tags: $(jq -r '.tags[:10] | join(", ")' /tmp/tags_response.json 2>/dev/null || echo '(could not parse)')"
+  exit 1
+fi
 
 # ── 3. Download the manifest ────────────────────────────────────────
+manifest_url="https://${REGISTRY}/v2/${IMAGE}/manifests/${TAG}"
 echo "--> Downloading manifest..."
-curl -sf \
-  -H "Authorization: Bearer ${token}" \
-  "https://${REGISTRY}/v2/${IMAGE}/manifests/${TAG}" \
-  -o manifest.json
+echo "    URL: ${manifest_url}"
+
+http_code=$(
+  curl -sS -w '%{http_code}' -o manifest.json \
+    -H "Authorization: Bearer ${token}" \
+    "${manifest_url}" \
+    2>/tmp/curl_err.log
+) || {
+  echo "ERROR: curl failed on manifest request"
+  echo "--- curl stderr ---"
+  cat /tmp/curl_err.log
+  exit 1
+}
+
+echo "    HTTP ${http_code}"
+
+if [[ "${http_code}" -ge 400 ]]; then
+  echo "ERROR: manifest request returned HTTP ${http_code}"
+  echo "--- response body ---"
+  cat manifest.json
+  exit 1
+fi
 
 # ── 4. Download every layer ──────────────────────────────────────────
 num_layers=$(jq '.history | length' manifest.json)
