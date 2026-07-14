@@ -8,13 +8,24 @@
 #
 # Requirements: curl, jq, docker (for the final load step)
 #
-# Usage:
-#   export IMAGE="library/hitch"
-#   export TAG="1.8.0-1"
+# Usage (public image):
+#   export IMAGE="library/nginx" TAG="latest"
+#   ./docker-pull-curl.sh
+#
+# Usage (private image with credentials):
+#   export IMAGE="myuser/myapp" TAG="v1.2.3"
+#   export DOCKER_USER="myuser" DOCKER_PASS="mypassword_or_PAT"
+#   ./docker-pull-curl.sh
+#
+# Usage (via SOCKS5 proxy, e.g. Tor or SSH tunnel):
+#   export IMAGE="library/nginx" TAG="latest"
+#   export PROXY="socks5h://127.0.0.1:9050"
 #   ./docker-pull-curl.sh
 #
 # For official images the namespace is "library/<name>".
 # For user images it's "<user>/<name>".
+# For GitHub Packages (ghcr.io), also set:
+#   export REGISTRY="ghcr.io" AUTH_URL="https://ghcr.io/token"
 
 set -euo pipefail
 
@@ -24,16 +35,37 @@ AUTH_URL="${AUTH_URL:-https://auth.docker.io/token}"
 IMAGE="${IMAGE:?Set IMAGE env var (e.g. library/nginx)}"
 TAG="${TAG:-latest}"
 OUTDIR="${OUTDIR:-layers}"
+DOCKER_USER="${DOCKER_USER:-}"          # optional: username
+DOCKER_PASS="${DOCKER_PASS:-}"          # optional: password or PAT
 # ─────────────────────────────────────────────────────────────────────
+# Proxy: curl natively honors ALL_PROXY / HTTPS_PROXY / https_proxy.
+# To route through a SOCKS5 proxy (e.g. Tor), just export before running:
+#   export ALL_PROXY="socks5h://127.0.0.1:9050"
+# No extra flags needed — curl picks it up automatically.
+if [[ -n "${ALL_PROXY:-}${HTTPS_PROXY:-}${https_proxy:-}" ]]; then
+  echo "==> Proxy detected: ${ALL_PROXY:-${HTTPS_PROXY:-${https_proxy:-}}}"
+fi
 
 echo "==> Downloading ${IMAGE}:${TAG} from ${REGISTRY}"
 
-# ── 1. Get an anonymous auth token ───────────────────────────────────
+# ── 1. Get an auth token (anonymous or authenticated) ────────────────
 echo "--> Requesting auth token..."
+auth_args=()
+if [[ -n "${DOCKER_USER}" && -n "${DOCKER_PASS}" ]]; then
+  echo "    (authenticating as ${DOCKER_USER})"
+  auth_args=(-u "${DOCKER_USER}:${DOCKER_PASS}")
+fi
+
 token=$(
-  curl -sf "${AUTH_URL}?service=registry.docker.io&scope=repository:${IMAGE}:pull" \
+  curl -sf "${auth_args[@]+"${auth_args[@]}"}" \
+    "${AUTH_URL}?service=registry.docker.io&scope=repository:${IMAGE}:pull" \
     | jq -jr '.token'
 )
+
+if [[ -z "${token}" || "${token}" == "null" ]]; then
+  echo "ERROR: failed to obtain auth token (bad credentials?)"
+  exit 1
+fi
 
 # ── 2. (Optional) List available tags ────────────────────────────────
 echo "--> Verifying tag '${TAG}' exists..."
