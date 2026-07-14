@@ -1,7 +1,7 @@
 # docker-curl-pull
 
 ### usage
-```
+```sh
 # Public image (anonymous)
 export IMAGE="library/nginx" TAG="latest"
 ./docker-pull-curl.sh
